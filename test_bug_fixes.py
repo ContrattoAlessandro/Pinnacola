@@ -2,7 +2,7 @@ import os
 import torch
 import numpy as np
 from pinnacola_env import PinnacolaEnv, ActionType
-from custom_avn_train import ValueNet, select_action, NStepReplayBuffer
+from custom_avn_train import ValueNet, select_action, PrioritizedNStepReplayBuffer
 
 def test_deadlock():
     print("Testing for deadlock with self-play opponent...")

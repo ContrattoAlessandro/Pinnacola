@@ -47,7 +47,7 @@ def test_action_override():
     print(f"Combinazioni valide disponibili: {valid_melds}")
     
     # Provo a giocare il SECONDO tris (i tre 9) passando la carta 9 come parametro
-    card_9_idx = env.card_to_idx[hand[3]]
+    card_9_idx = env._get_dense_idx(hand[3])
     action = np.array([ActionType.MELD_SET, card_9_idx, 0, 3])
     
     print(f"Eseguo azione MELD_SET per la carta: {hand[3]}")

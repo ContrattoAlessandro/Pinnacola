@@ -21,48 +21,135 @@ from pinnacola_env import PinnacolaEnv, Meld
 # ARCHITETTURA RETE NEURALE: V(s)
 # ============================================================================
 
-class ValueNet(nn.Module):
-    """MLP per stimare V(s). Output: singolo scalare."""
-    def __init__(self, obs_dim):
+class ResidualBlock(nn.Module):
+    def __init__(self, hidden_dim):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.ln1(self.fc1(x)))
+        out = self.ln2(self.fc2(out))
+        out = out + residual
+        return F.relu(out)
+
+class ValueNet(nn.Module):
+    """ResNet + LayerNorm per stimare V(s). Output: singolo scalare."""
+    def __init__(self, obs_dim, hidden_dim=512, num_blocks=3):
+        super().__init__()
+        self.input_layer = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU()
+        )
+        
+        self.res_blocks = nn.Sequential(
+            *[ResidualBlock(hidden_dim) for _ in range(num_blocks)]
+        )
+        
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 1)
         )
         
     def forward(self, x):
-        return self.net(x)
+        x = self.input_layer(x)
+        x = self.res_blocks(x)
+        return self.output_layer(x)
 
 # ============================================================================
 # REPLAY BUFFER
 # ============================================================================
 
-class NStepReplayBuffer:
-    """Buffer circolare con accumulo N-Step TD."""
-    def __init__(self, capacity=100000, n_step=3, gamma=0.99):
-        self.buffer = deque(maxlen=capacity)
+class SumTree:
+    """Implementazione rapida di un Segment Tree per gestire le priorità."""
+    def __init__(self, capacity):
+        self.capacity = capacity
+        # tree ha dimensione 2*capacity - 1
+        self.tree = np.zeros(2 * capacity - 1)
+        # buffer dati
+        self.data = np.zeros(capacity, dtype=object)
+        self.write = 0
+        self.n_entries = 0
+
+    def _propagate(self, idx, change):
+        parent = (idx - 1) // 2
+        self.tree[parent] += change
+        if parent != 0:
+            self._propagate(parent, change)
+
+    def _retrieve(self, idx, s):
+        left = 2 * idx + 1
+        right = left + 1
+
+        if left >= len(self.tree):
+            return idx
+
+        if s <= self.tree[left]:
+            return self._retrieve(left, s)
+        else:
+            return self._retrieve(right, s - self.tree[left])
+
+    def total(self):
+        return self.tree[0]
+
+    def add(self, p, data):
+        idx = self.write + self.capacity - 1
+        self.data[self.write] = data
+        self.update(idx, p)
+        self.write += 1
+        if self.write >= self.capacity:
+            self.write = 0
+        if self.n_entries < self.capacity:
+            self.n_entries += 1
+
+    def update(self, idx, p):
+        change = p - self.tree[idx]
+        self.tree[idx] = p
+        self._propagate(idx, change)
+
+    def get(self, s):
+        idx = self._retrieve(0, s)
+        dataIdx = idx - self.capacity + 1
+        dataIdx = max(0, min(dataIdx, self.capacity - 1))  # BUG 4 fix: clamp
+        return idx, self.tree[idx], self.data[dataIdx]
+
+
+class PrioritizedNStepReplayBuffer:
+    """Buffer PER con N-Step TD."""
+    def __init__(self, capacity=100000, n_step=3, gamma=0.99, alpha=0.6):
+        self.tree = SumTree(capacity)
         self.n_step = n_step
         self.gamma = gamma
         self.n_step_buffer = deque(maxlen=n_step)
+        
+        # PER params
+        self.alpha = alpha
+        self.epsilon = 1e-5
         
     def push(self, state, reward, next_state, done):
         self.n_step_buffer.append((state, reward, next_state, done))
         if len(self.n_step_buffer) == self.n_step:
             s, r, s_next, d = self._get_n_step_info()
-            self.buffer.append((s, r, s_next, d))
+            # Priorità massima per la nuova transizione
+            max_p = np.max(self.tree.tree[-self.tree.capacity:]) if self.tree.n_entries > 0 else 1.0
+            self.tree.add(max_p, (s, r, s_next, d))
             
         if done:
-            # Svuota il buffer a fine episodio
+            # BUG 1 fix: se il buffer è pieno, la transizione completa è già stata
+            # aggiunta sopra. Pop il primo elemento per evitare duplicati.
+            if len(self.n_step_buffer) == self.n_step:
+                self.n_step_buffer.popleft()
+            # Svuota il buffer a fine episodio (transizioni parziali rimanenti)
             while len(self.n_step_buffer) > 0:
                 s, r, s_next, d = self._get_n_step_info()
-                self.buffer.append((s, r, s_next, d))
+                max_p = np.max(self.tree.tree[-self.tree.capacity:]) if self.tree.n_entries > 0 else 1.0
+                self.tree.add(max_p, (s, r, s_next, d))
                 self.n_step_buffer.popleft()
-            self.n_step_buffer.clear()
             
     def _get_n_step_info(self):
         # Il primo stato della sequenza
@@ -81,18 +168,53 @@ class NStepReplayBuffer:
                 
         return state, reward, next_state, done
         
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
+    def sample(self, batch_size, beta=0.4):
+        batch = []
+        idxs = []
+        priorities = []
+        
+        total = self.tree.total()
+        # BUG 2 fix: guard against zero total priority
+        if total <= 0:
+            total = 1e-8
+        segment = total / batch_size
+        
+        for i in range(batch_size):
+            a = segment * i
+            b = segment * (i + 1)
+            s = random.uniform(a, b)
+            
+            idx, p, data = self.tree.get(s)
+            
+            batch.append(data)
+            idxs.append(idx)
+            priorities.append(p)
+            
+        # Calcolo dei pesi IS
+        # BUG 3 fix: clip probabilities to prevent inf/NaN in IS weights
+        sampling_probabilities = np.array(priorities) / total
+        sampling_probabilities = np.maximum(sampling_probabilities, 1e-8)
+        is_weights = np.power(self.tree.n_entries * sampling_probabilities, -beta)
+        is_weights /= is_weights.max()
+        
         states, rewards, next_states, dones = zip(*batch)
+        
         return (
             np.array(states, dtype=np.float32),
             np.array(rewards, dtype=np.float32),
             np.array(next_states, dtype=np.float32),
-            np.array(dones, dtype=np.float32)
+            np.array(dones, dtype=np.float32),
+            idxs,
+            np.array(is_weights, dtype=np.float32)
         )
         
+    def update_priorities(self, idxs, td_errors):
+        for idx, td_error in zip(idxs, td_errors):
+            p = (abs(td_error) + self.epsilon) ** self.alpha
+            self.tree.update(idx, p)
+            
     def __len__(self):
-        return len(self.buffer)
+        return self.tree.n_entries
 
 # ============================================================================
 # STATE SAVE/RESTORE (sostituisce deepcopy, ~50x più veloce)
@@ -112,7 +234,8 @@ def save_env_state(env: PinnacolaEnv) -> dict:
         'bot_melded_this_turn': env.bot_melded_this_turn,
         'round_over': env.round_over,
         'cards_seen': env.cards_seen.copy(),
-        'must_meld_card': copy.deepcopy(env.must_meld_card) if hasattr(env, 'must_meld_card') else None
+        'must_meld_card': copy.deepcopy(env.must_meld_card) if hasattr(env, 'must_meld_card') else None,
+        'can_close_this_turn': env.can_close_this_turn,
     }
 
 def restore_env_state(env: PinnacolaEnv, state: dict):
@@ -130,6 +253,7 @@ def restore_env_state(env: PinnacolaEnv, state: dict):
     env.cards_seen = state['cards_seen'].copy()
     if 'must_meld_card' in state:
         env.must_meld_card = copy.deepcopy(state['must_meld_card'])
+    env.can_close_this_turn = state.get('can_close_this_turn', False)
 
 # ============================================================================
 # DEDUPLICA AZIONI (evita simulare azioni equivalenti)
@@ -302,7 +426,7 @@ def train_avn(total_timesteps=100_000, save_dir="./models"):
     env.opponent_policy_fn = opponent_policy
     
     optimizer = torch.optim.Adam(policy_net.parameters(), lr=3e-4)
-    buffer = NStepReplayBuffer(capacity=100_000, n_step=3, gamma=0.99)
+    buffer = PrioritizedNStepReplayBuffer(capacity=100_000, n_step=3, gamma=0.99, alpha=0.6)
     
     # Iperparametri
     batch_size = 128             # Più grande per sfruttare la GPU
@@ -340,6 +464,11 @@ def train_avn(total_timesteps=100_000, save_dir="./models"):
         # Epsilon decay lineare
         epsilon = eps_end + (eps_start - eps_end) * max(0, (eps_decay - step) / eps_decay)
         
+        # PER beta annealing
+        beta_start = 0.4
+        beta_frames = total_timesteps
+        beta = min(1.0, beta_start + step * (1.0 - beta_start) / beta_frames)
+        
         # 1. Seleziona azione (con save/restore, non deepcopy)
         if step < 10:
             print(f"[DEBUG] Step {step} Selecting action...")
@@ -368,12 +497,13 @@ def train_avn(total_timesteps=100_000, save_dir="./models"):
         
         # 4. Ottimizzazione su GPU
         if step > learning_starts and step % train_freq == 0:
-            s_batch, r_batch, s_next_batch, done_batch = buffer.sample(batch_size)
+            s_batch, r_batch, s_next_batch, done_batch, batch_idxs, is_weights = buffer.sample(batch_size, beta)
             
             s_batch = torch.FloatTensor(s_batch).to(device)
             r_batch = torch.FloatTensor(r_batch).to(device)
             s_next_batch = torch.FloatTensor(s_next_batch).to(device)
             done_batch = torch.FloatTensor(done_batch).to(device)
+            is_weights_tensor = torch.FloatTensor(is_weights).to(device)
             
             with torch.no_grad():
                 v_next = target_net(s_next_batch).squeeze(-1)
@@ -381,7 +511,13 @@ def train_avn(total_timesteps=100_000, save_dir="./models"):
                 target_v = r_batch + n_step_gamma * v_next * (1 - done_batch)
                 
             v_curr = policy_net(s_batch).squeeze(-1)
-            loss = F.mse_loss(v_curr, target_v)
+            
+            # Calcolo TD error per l'update delle priorità
+            td_errors = (target_v - v_curr).abs().detach().cpu().numpy()
+            buffer.update_priorities(batch_idxs, td_errors)
+            
+            # Weighted MSE Loss
+            loss = (is_weights_tensor * F.mse_loss(v_curr, target_v, reduction='none')).mean()
             
             optimizer.zero_grad()
             loss.backward()

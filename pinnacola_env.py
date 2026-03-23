@@ -161,6 +161,7 @@ class PinnacolaEnv(gym.Env):
     perché il 99% delle combinazioni non è valida in un dato turno.
     """
     
+    
     # Costanti del gioco
     NUM_DECKS = 2
     CARDS_PER_DECK = 54  # 52 + 2 Jolly
@@ -169,6 +170,12 @@ class PinnacolaEnv(gym.Env):
     CARDS_PER_PLAYER = 13
     MAX_MELDS = 20  # Massimo numero di giochi sul tavolo
     MAX_HAND_SIZE = 20  # Dimensione max mano (con pozzo raccolto)
+    DENSE_DIM = 53  # 52 carte standard + 1 jolly
+    
+    def _get_dense_idx(self, card: Card) -> int:
+        if card.rank == CardRank.JOKER:
+            return 52
+        return (card.rank - 1) * 4 + card.suit
     
     # Punteggi (in parte gestiti dinamicamente)
     POINTS_MELD_SET = 5
@@ -195,13 +202,13 @@ class PinnacolaEnv(gym.Env):
         # Observation Space
         # Calcola dimensione totale dello stato piatto
         obs_dim = (
-            self.TOTAL_CARDS +  # Mano bot (one-hot multiplo, max 13 carte)
-            self.TOTAL_CARDS +  # Pozzo top
-            self.TOTAL_CARDS +  # Carte nel pozzo (count)
-            self.MAX_MELDS * (self.TOTAL_CARDS + 3) +  # Giochi: carte + metadata
+            self.DENSE_DIM +  # Mano bot (count, max 13 carte)
+            self.DENSE_DIM +  # Carte nel pozzo (count)
+            2 +               # Pozzo top (rank, suit)
+            self.MAX_MELDS * 7 + # Giochi: 7 features
             (self.num_players - 1) +  # Carte avversari
-            self.TOTAL_CARDS +  # Carte viste (memoria)
-            self.TOTAL_CARDS +  # Carta obbligata (must_meld_card)
+            self.DENSE_DIM +  # Carte viste (memoria)
+            self.DENSE_DIM +  # Carta obbligata (must_meld_card)
             4  # Fase turno
         )
         
@@ -218,7 +225,7 @@ class PinnacolaEnv(gym.Env):
         # Usiamo MultiDiscrete per rappresentare azioni fattorizzate
         self.action_space = gym.spaces.MultiDiscrete([
             len(ActionType),  # Tipo azione
-            self.TOTAL_CARDS,  # Carta specifica
+            self.DENSE_DIM,  # Carta specifica (dense idx)
             self.MAX_MELDS,    # Meld target
             10                 # Parametro extra
         ])
@@ -262,62 +269,59 @@ class PinnacolaEnv(gym.Env):
         # Semplificazione: action_type * card * meld * param
         # In pratica useremo un encoding più smart, ma per la maschera
         # ci serve una dimensione fissa
-        return len(ActionType) * self.TOTAL_CARDS * self.MAX_MELDS * 10
+        return len(ActionType) * self.DENSE_DIM * self.MAX_MELDS * 10
     
     def _encode_hand(self, hand: List[Card]) -> np.ndarray:
-        """Codifica mano come vettore one-hot count (108-dim)."""
-        encoded = np.zeros(self.TOTAL_CARDS, dtype=np.float32)
+        """Codifica mano come vettore count (53-dim)."""
+        encoded = np.zeros(self.DENSE_DIM, dtype=np.float32)
         for card in hand:
-            idx = self.card_to_idx[card]
-            encoded[idx] += 1
+            encoded[self._get_dense_idx(card)] += 1
         return encoded
     
     def _encode_melds(self) -> np.ndarray:
-        """Codifica giochi sul tavolo."""
-        # Ogni meld: one-hot carte + tipo + owner
-        encoded = np.zeros(self.MAX_MELDS * (self.TOTAL_CARDS + 3), dtype=np.float32)
+        """Codifica giochi sul tavolo (Dense: [Type, Suit, BaseRank, HighRank, Len, HasJoker, Owner])."""
+        encoded = np.zeros(self.MAX_MELDS * 7, dtype=np.float32)
         for i, meld in enumerate(self.table_melds[:self.MAX_MELDS]):
-            base_idx = i * (self.TOTAL_CARDS + 3)
-            # Carte nel meld
-            for card in meld.cards:
-                card_idx = self.card_to_idx[card]
-                encoded[base_idx + card_idx] = 1
-            # Metadata: tipo (0=set, 1=run)
-            encoded[base_idx + self.TOTAL_CARDS] = 0 if meld.meld_type == 'set' else 1
-            # Owner
-            encoded[base_idx + self.TOTAL_CARDS + 1] = meld.owner
-            # Numero carte
-            encoded[base_idx + self.TOTAL_CARDS + 2] = len(meld.cards)
+            base_idx = i * 7
+            encoded[base_idx] = 0.0 if meld.meld_type == 'set' else 1.0 # Tipo
+            if meld.meld_type == 'set':
+                encoded[base_idx + 1] = -1.0 # Seme di un tris è misto
+                non_jokers = [c for c in meld.cards if c.rank != CardRank.JOKER]
+                encoded[base_idx + 2] = float(non_jokers[0].rank) if non_jokers else 0.0
+                encoded[base_idx + 3] = 0.0
+            else:
+                suit = meld.cards[0].suit if meld.cards[0].rank != CardRank.JOKER else meld.cards[1].suit
+                encoded[base_idx + 1] = float(suit)
+                ranks = sorted([c.rank for c in meld.cards if c.rank != CardRank.JOKER])
+                encoded[base_idx + 2] = float(ranks[0]) if ranks else 0.0
+                encoded[base_idx + 3] = float(ranks[-1]) if ranks else 0.0
+            encoded[base_idx + 4] = float(len(meld.cards))
+            encoded[base_idx + 5] = 1.0 if meld.has_joker() else 0.0
+            encoded[base_idx + 6] = float(meld.owner)
         return encoded
     
+
     def _get_observation(self, player_id: Optional[int] = None) -> np.ndarray:
-        """Compone l'observation vector completo per un dato giocatore."""
         if player_id is None:
             player_id = self.current_player
             
         obs_parts = []
-        
-        # 1. Mano del giocatore (one-hot)
         bot_hand = self.player_hands[player_id]
         obs_parts.append(self._encode_hand(bot_hand))
         
-        # 2. Carta in cima al pozzo
-        top_discard = np.zeros(self.TOTAL_CARDS, dtype=np.float32)
-        if self.discard_pile:
-            top_idx = self.card_to_idx[self.discard_pile[-1]]
-            top_discard[top_idx] = 1
-        obs_parts.append(top_discard)
-        
-        # 3. Tutte le carte nel pozzo (count)
-        discard_count = np.zeros(self.TOTAL_CARDS, dtype=np.float32)
+        discard_count = np.zeros(self.DENSE_DIM, dtype=np.float32)
         for card in self.discard_pile:
-            discard_count[self.card_to_idx[card]] += 1
+            discard_count[self._get_dense_idx(card)] += 1
         obs_parts.append(discard_count)
         
-        # 4. Giochi sul tavolo
+        top_discard = np.zeros(2, dtype=np.float32)
+        if self.discard_pile:
+            top_discard[0] = float(self.discard_pile[-1].rank)
+            top_discard[1] = float(self.discard_pile[-1].suit)
+        obs_parts.append(top_discard)
+        
         obs_parts.append(self._encode_melds())
         
-        # 5. Numero carte in mano agli avversari
         opponent_cards = np.zeros(self.num_players - 1, dtype=np.float32)
         idx = 0
         for i in range(self.num_players):
@@ -326,16 +330,13 @@ class PinnacolaEnv(gym.Env):
                 idx += 1
         obs_parts.append(opponent_cards)
         
-        # 6. Carte viste (memoria per probabilità)
         obs_parts.append(self.cards_seen[player_id].astype(np.float32) / self.NUM_DECKS)
         
-        # 7. Carta obbligata (must_meld_card) one-hot
-        must_meld = np.zeros(self.TOTAL_CARDS, dtype=np.float32)
+        must_meld = np.zeros(self.DENSE_DIM, dtype=np.float32)
         if self.must_meld_card:
-            must_meld[self.card_to_idx[self.must_meld_card]] = 1
+            must_meld[self._get_dense_idx(self.must_meld_card)] = 1
         obs_parts.append(must_meld)
         
-        # 8. Fase del turno (one-hot)
         phase = np.zeros(4, dtype=np.float32)
         phase[self.game_phase] = 1
         obs_parts.append(phase)
@@ -360,7 +361,7 @@ class PinnacolaEnv(gym.Env):
                 # Può pescare dal pozzo fino a una specifica carta,
                 # purché la mano risultante contenga una combinazione valida con quella carta
                 for i, card in enumerate(self.discard_pile):
-                    target_card_idx = self.card_to_idx[card]
+                    target_card_idx = self._get_dense_idx(card)
                     cards_to_take = self.discard_pile[i:]
                     simulated_hand = bot_hand + cards_to_take
                     
@@ -394,7 +395,7 @@ class PinnacolaEnv(gym.Env):
                     is_set = len(set(c.rank for c in meld_cards if c.rank != CardRank.JOKER)) == 1
                     action_type = ActionType.MELD_SET if is_set else ActionType.MELD_RUN
                     repr_card = next((c for c in meld_cards if c.rank != CardRank.JOKER), meld_cards[0])
-                    legal.append((action_type, self.card_to_idx[repr_card], 0, len(meld_cards)))
+                    legal.append((action_type, self._get_dense_idx(repr_card), 0, len(meld_cards)))
             
             if len(bot_hand) >= 2:
                 for meld_idx, meld in enumerate(self.table_melds):
@@ -403,7 +404,7 @@ class PinnacolaEnv(gym.Env):
                             if self.must_meld_card and card != self.must_meld_card:
                                 continue
                             if meld.can_attach(card):
-                                legal.append((ActionType.ATTACH_CARD, self.card_to_idx[card], meld_idx, 0))
+                                legal.append((ActionType.ATTACH_CARD, self._get_dense_idx(card), meld_idx, 0))
             
             # Sostituire Jolly (non soddisfa l'obbligo di must_meld_card)
             if not self.must_meld_card:
@@ -411,7 +412,7 @@ class PinnacolaEnv(gym.Env):
                     if meld.has_joker():
                         for card in bot_hand:
                             if self._can_replace_joker(meld, card):
-                                legal.append((ActionType.REPLACE_JOKER, self.card_to_idx[card], meld_idx, 0))
+                                legal.append((ActionType.REPLACE_JOKER, self._get_dense_idx(card), meld_idx, 0))
             
             # Può saltare la fase o terminare, MA non se ha una carta obbligata
             if not self.must_meld_card:
@@ -420,7 +421,7 @@ class PinnacolaEnv(gym.Env):
         elif self.game_phase == GamePhase.DISCARD:
             # Deve scartare una carta dalla mano per chiudere il turno o chiudere la partita
             for card in bot_hand:
-                legal.append((ActionType.DISCARD, self.card_to_idx[card], 0, 0))
+                legal.append((ActionType.DISCARD, self._get_dense_idx(card), 0, 0))
             
             # (Il CLOSE_ROUND esplicito è stato rimosso, la partita finisce automaticamente scartando l'ultima carta)
         
@@ -540,7 +541,7 @@ class PinnacolaEnv(gym.Env):
                             for combo in itertools.product(*(rank_map[r] for r in subset_ranks)):
                                 valid_melds.append(list(combo) + jokers[:2])
                         # 0 buchi interni + 2 jolly per estendere
-                        elif gaps == 0 and num_real >= 1 and num_real + 2 >= 3:
+                        elif gaps == 0 and num_real >= 2 and num_real + 2 >= 3:
                             for combo in itertools.product(*(rank_map[r] for r in subset_ranks)):
                                 valid_melds.append(list(combo) + jokers[:2])
         
@@ -588,10 +589,10 @@ class PinnacolaEnv(gym.Env):
                 if ranks[i+1] - ranks[i] > 1:
                     possible_gaps.extend(range(ranks[i] + 1, ranks[i+1]))
             
-            # Verifica anche Asso alto (rank 1 sostituisce dopo K=13)
+            # Verifica anche Asso alto
             possible_ranks = possible_gaps
-            if ranks[-1] + 1 == CardRank.JOKER:
-                # ranks[-1] è 13 (K), il jolly potrebbe rappresentare l'Asso alto
+            if ranks[-1] == CardRank.KING:  # BUG 8 fix: semantic check
+                # Il jolly potrebbe rappresentare l'Asso alto
                 if card.rank == CardRank.ACE:
                     return True
             return card.rank in possible_ranks
@@ -607,7 +608,7 @@ class PinnacolaEnv(gym.Env):
             # Flatten action tuple to index
             # Encoding: ((action_type * cards + card) * melds + meld) * params + param
             flat_idx = (
-                action[0] * self.TOTAL_CARDS * self.MAX_MELDS * 10 +
+                action[0] * self.DENSE_DIM * self.MAX_MELDS * 10 +
                 action[1] * self.MAX_MELDS * 10 +
                 action[2] * 10 +
                 action[3]
@@ -637,14 +638,14 @@ class PinnacolaEnv(gym.Env):
         
         # Reset stato
         self.table_melds = []
-        self.cards_seen = np.zeros((self.num_players, self.TOTAL_CARDS), dtype=np.int32)
+        self.cards_seen = np.zeros((self.num_players, self.DENSE_DIM), dtype=np.int32)
         
         # Registra carte già viste per ogni giocatore
         for p in range(self.num_players):
             for card in self.player_hands[p]:
-                self.cards_seen[p, self.card_to_idx[card]] += 1
+                self.cards_seen[p, self._get_dense_idx(card)] += 1
             for card in self.discard_pile:
-                self.cards_seen[p, self.card_to_idx[card]] += 1
+                self.cards_seen[p, self._get_dense_idx(card)] += 1
         
         self.current_player = 0
         self.game_phase = GamePhase.DRAW
@@ -722,6 +723,19 @@ class PinnacolaEnv(gym.Env):
         
         return {'observation': obs, 'action_mask': mask}, reward, terminated, truncated, info
     
+
+    def _find_card_in_hand_by_dense(self, dense_idx: int) -> Optional[Card]:
+        for c in self.player_hands[self.current_player]:
+            if self._get_dense_idx(c) == dense_idx:
+                return c
+        return None
+
+    def _find_card_in_discard_by_dense(self, dense_idx: int) -> Optional[Card]:
+        for c in reversed(self.discard_pile):
+            if self._get_dense_idx(c) == dense_idx:
+                return c
+        return None
+
     def _action_draw_stock(self) -> float:
         """Pesca dal tallone."""
         if not self.stock_pile or self.game_phase != GamePhase.DRAW:
@@ -729,7 +743,7 @@ class PinnacolaEnv(gym.Env):
         
         card = self.stock_pile.pop()
         self.player_hands[self.current_player].append(card)
-        self.cards_seen[self.current_player, self.card_to_idx[card]] += 1
+        self.cards_seen[self.current_player, self._get_dense_idx(card)] += 1
         self.bot_has_drawn = True
         self.game_phase = GamePhase.MELD
         return 0.1  # Piccola reward per azione valida
@@ -739,7 +753,7 @@ class PinnacolaEnv(gym.Env):
         if not self.discard_pile or self.game_phase != GamePhase.DRAW:
             return -1.0
             
-        target_card = self.idx_to_card.get(card_idx)
+        target_card = self._find_card_in_discard_by_dense(card_idx)
         if target_card not in self.discard_pile:
             return -1.0
             
@@ -799,7 +813,9 @@ class PinnacolaEnv(gym.Env):
         if not valid_melds:
             return -1.0  # Nessuna combinazione valida
         
-        target_card = self.idx_to_card.get(card_idx)
+        target_card = self._find_card_in_hand_by_dense(card_idx)
+        if not target_card:
+            return -1.0
         
         # Cerca la combinazione che corrisponde a target_card e num_cards
         meld_cards = None
@@ -809,8 +825,7 @@ class PinnacolaEnv(gym.Env):
                 break
                 
         if not meld_cards:
-            # Fallback (non dovrebbe verificarsi in un mapping corretto azione-stato)
-            meld_cards = valid_melds[0]
+            return -1.0  # Nessuna combinazione corrispondente trovata
         
         # Rimuovi carte dalla mano
         for card in meld_cards:
@@ -845,8 +860,8 @@ class PinnacolaEnv(gym.Env):
         if meld_idx >= len(self.table_melds):
             return -1.0
         
-        card = self.idx_to_card.get(card_idx)
-        if not card or card not in self.player_hands[self.current_player]:
+        card = self._find_card_in_hand_by_dense(card_idx)
+        if not card:
             return -1.0
         
         meld = self.table_melds[meld_idx]
@@ -884,8 +899,8 @@ class PinnacolaEnv(gym.Env):
         if meld_idx >= len(self.table_melds):
             return -1.0
         
-        card = self.idx_to_card.get(card_idx)
-        if not card or card not in self.player_hands[self.current_player]:
+        card = self._find_card_in_hand_by_dense(card_idx)
+        if not card:
             return -1.0
         
         meld = self.table_melds[meld_idx]
@@ -918,8 +933,8 @@ class PinnacolaEnv(gym.Env):
     
     def _action_discard(self, card_idx: int) -> float:
         """Scarta una carta e opzionalmente chiude se la mano si svuota."""
-        card = self.idx_to_card.get(card_idx)
-        if not card or card not in self.player_hands[self.current_player]:
+        card = self._find_card_in_hand_by_dense(card_idx)
+        if not card:
             return -1.0
         
         self.player_hands[self.current_player].remove(card)
@@ -927,7 +942,7 @@ class PinnacolaEnv(gym.Env):
         
         for p in range(self.num_players):
             if p != self.current_player:
-                self.cards_seen[p, self.card_to_idx[card]] += 1
+                self.cards_seen[p, self._get_dense_idx(card)] += 1
                 
         # Chiude il round se la mano è diventata vuota
         if len(self.player_hands[self.current_player]) == 0:
@@ -937,8 +952,10 @@ class PinnacolaEnv(gym.Env):
         # Passa al prossimo giocatore
         self.current_player = (self.current_player + 1) % self.num_players
         self.game_phase = GamePhase.DRAW
-        self.bot_has_drawn = False
-        self.bot_melded_this_turn = False
+        # BUG 9 fix: resetta flag bot solo se era il turno del bot
+        if self.current_player == self.bot_player_id:
+            self.bot_has_drawn = False
+            self.bot_melded_this_turn = False
         self.turn_count += 1
         
         return 0.1
@@ -985,7 +1002,7 @@ class PinnacolaEnv(gym.Env):
                         elif self.game_phase == GamePhase.DISCARD:
                             if self.player_hands[player]:
                                 card = self.player_hands[player][0]
-                                self._action_discard(self.card_to_idx[card])
+                                self._action_discard(self._get_dense_idx(card))
                             else:
                                 self.round_over = True
                             continue
@@ -1031,7 +1048,7 @@ class PinnacolaEnv(gym.Env):
                         self.discard_pile.append(discard_card)
                         for p in range(self.num_players):
                             if p != player:
-                                self.cards_seen[p, self.card_to_idx[discard_card]] += 1
+                                self.cards_seen[p, self._get_dense_idx(discard_card)] += 1
                     
                     if not self.player_hands[player]:
                         self.round_over = True
@@ -1050,10 +1067,11 @@ class PinnacolaEnv(gym.Env):
             if self.stock_pile:
                 card = self.stock_pile.pop()
                 hand.append(card)
+                self.cards_seen[player, self._get_dense_idx(card)] += 1
             elif self.discard_pile:
                 # Politica random semplificata: prende l'ultima dal pozzo senza obblighi
                 card = self.discard_pile[-1]
-                idx = self.card_to_idx[card]
+                idx = self._get_dense_idx(card)
                 self._action_draw_pile(idx)
                 # Forza cleans limitando deadlock bot semplificato avversario
                 self.must_meld_card = None
@@ -1110,7 +1128,7 @@ class PinnacolaEnv(gym.Env):
                 # Aggiorna cards_seen per tutti gli altri giocatori (vedono lo scarto)
                 for p in range(self.num_players):
                     if p != player:
-                        self.cards_seen[p, self.card_to_idx[discard_card]] += 1
+                        self.cards_seen[p, self._get_dense_idx(discard_card)] += 1
             
             # Incrementa il contatore turni per ogni giocatore
             self.turn_count += 1
@@ -1118,8 +1136,14 @@ class PinnacolaEnv(gym.Env):
             # Passa al prossimo
             self.current_player = (self.current_player + 1) % self.num_players
             
-            # Verifica scarto chiusura
-            if not hand: # Mano svuotata = round finito
+            # Verifica scarto chiusura: mano svuotata E ha calato almeno un meld
+            has_melded = any(m.owner == player for m in self.table_melds)
+            if not hand and has_melded:
+                self.round_over = True
+                break
+            elif not hand:
+                # Mano vuota ma nessun meld calato: non può chiudere
+                # In pratica non dovrebbe succedere (scarta solo se hand non vuoto)
                 self.round_over = True
                 break
     
