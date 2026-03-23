@@ -864,6 +864,36 @@ class PinnacolaEnv(gym.Env):
         """
         while self.current_player != self.bot_player_id and not self.round_over:
             player = self.current_player
+            
+            if self.opponent_policy_fn:
+                action_tuple = self.opponent_policy_fn(self, player)
+                action_type = int(action_tuple[0])
+                card_idx = int(action_tuple[1])
+                meld_idx = int(action_tuple[2])
+                param = int(action_tuple[3])
+
+                if action_type == ActionType.DRAW_STOCK:
+                    self._action_draw_stock()
+                elif action_type == ActionType.DRAW_PILE:
+                    self._action_draw_pile()
+                elif action_type == ActionType.MELD_SET or action_type == ActionType.MELD_RUN:
+                    self._action_meld(action_type, card_idx, param)
+                elif action_type == ActionType.ATTACH_CARD:
+                    self._action_attach(card_idx, meld_idx)
+                elif action_type == ActionType.REPLACE_JOKER:
+                    self._action_replace_joker(card_idx, meld_idx)
+                elif action_type == ActionType.SKIP_MELD:
+                    self._action_skip_meld()
+                elif action_type == ActionType.DISCARD:
+                    self._action_discard(card_idx)
+                elif action_type == ActionType.CLOSE_ROUND:
+                    self._action_close_round()
+                
+                # Controllo stalemate
+                if not self.stock_pile and not self.discard_pile:
+                    self.round_over = True
+                continue
+            
             hand = self.player_hands[player]
             
             # Fase 1: Pesca (sempre dal tallone per semplicità)

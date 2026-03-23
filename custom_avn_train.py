@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from pinnacola_env import PinnacolaEnv
+from pinnacola_env import PinnacolaEnv, Meld
 
 # ============================================================================
 # ARCHITETTURA RETE NEURALE: V(s)
@@ -104,7 +104,7 @@ def save_env_state(env: PinnacolaEnv) -> dict:
         'player_hands': [hand[:] for hand in env.player_hands],
         'stock_pile': env.stock_pile[:],
         'discard_pile': env.discard_pile[:],
-        'table_melds': copy.deepcopy(env.table_melds),  # Solo i melds servono deepcopy
+        'table_melds': [Meld(m.meld_id, m.meld_type, m.cards[:], m.owner) for m in env.table_melds],  # Copia manuale più veloce
         'cards_seen': env.cards_seen.copy(),
         'current_player': env.current_player,
         'game_phase': env.game_phase,
@@ -120,7 +120,7 @@ def restore_env_state(env: PinnacolaEnv, state: dict):
     env.player_hands = [hand[:] for hand in state['player_hands']]
     env.stock_pile = state['stock_pile'][:]
     env.discard_pile = state['discard_pile'][:]
-    env.table_melds = copy.deepcopy(state['table_melds'])
+    env.table_melds = [Meld(m.meld_id, m.meld_type, m.cards[:], m.owner) for m in state['table_melds']]
     env.cards_seen = state['cards_seen'].copy()
     env.current_player = state['current_player']
     env.game_phase = state['game_phase']

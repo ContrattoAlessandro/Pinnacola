@@ -9,21 +9,19 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Body
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import numpy as np
 
-# Carica modello RL (se disponibile)
-try:
-    from stable_baselines3 import PPO
-    RL_AVAILABLE = True
-except ImportError:
-    RL_AVAILABLE = False
-
 # Environment
+import torch
+from custom_avn_train import ValueNet, select_action, get_device
 from pinnacola_env import PinnacolaEnv, ActionType, Card, CardRank, CardSuit
+
+RL_AVAILABLE = True
+device = get_device()
 
 app = FastAPI(title="Pinnacola RL Assistant API")
 
@@ -83,10 +81,18 @@ def get_rl_model():
     """Lazy loading del modello RL."""
     global rl_model
     if rl_model is None and RL_AVAILABLE:
-        model_path = os.getenv("MODEL_PATH", "./models/ppo_pinnacola_final.zip")
+        model_path = os.getenv("MODEL_PATH", "./models/avn_pinnacola_best.pth")
         if os.path.exists(model_path):
             try:
-                rl_model = PPO.load(model_path)
+                # Need to determine obs_dim to initialize custom ValueNet
+                dummy_env = PinnacolaEnv()
+                obs, _ = dummy_env.reset()
+                obs_dim = obs['observation'].shape[0]
+                
+                model = ValueNet(obs_dim).to(device)
+                model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+                model.eval()
+                rl_model = model
                 print(f"✅ Model loaded from {model_path}")
             except Exception as e:
                 print(f"⚠️ Failed to load model: {e}")
@@ -193,12 +199,12 @@ async def predict_move(request: PredictMoveRequest):
     model = get_rl_model()
     
     if model and RL_AVAILABLE:
-        # Usa modello RL
-        action, _ = model.predict(obs, deterministic=True)
-        action_type = int(action[0])
-        card_idx = int(action[1])
-        meld_idx = int(action[2])
-        param = int(action[3])
+        # Usa modello RL custom AVN
+        action_tuple = select_action(env, model, epsilon=0.0, device=device, max_actions=50)
+        action_type = int(action_tuple[0])
+        card_idx = int(action_tuple[1])
+        meld_idx = int(action_tuple[2])
+        param = int(action_tuple[3])
         confidence = 0.9
     else:
         # Fallback: regole euristiche
@@ -262,7 +268,7 @@ async def predict_move(request: PredictMoveRequest):
     )
 
 @app.post("/api/execute_action")
-async def execute_action(game_id: str, action: List[int]):
+async def execute_action(game_id: str, action: List[int] = Body(...)):
     """Esegue un'azione nel gioco e aggiorna lo stato."""
     
     game = active_games.get(game_id)
