@@ -8,6 +8,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Set
 from enum import IntEnum
 from dataclasses import dataclass, field
+import itertools
 
 
 class CardRank(IntEnum):
@@ -92,19 +93,35 @@ class Meld:
     
     def can_attach(self, card: Card) -> bool:
         """Verifica se una carta può essere attaccata a questo gioco."""
+        if card.rank == CardRank.JOKER:
+            return False  # Non si attacca un Jolly direttamente
         if self.meld_type == 'set':
-            # Tris: stesso rank, qualsiasi seme
-            return card.rank == self.cards[0].rank
+            # Tris: stesso rank, seme diverso da quelli già presenti
+            non_joker = [c for c in self.cards if c.rank != CardRank.JOKER]
+            if not non_joker:
+                return False
+            if card.rank != non_joker[0].rank:
+                return False
+            existing_suits = {c.suit for c in non_joker}
+            return card.suit not in existing_suits and len(self.cards) < 4
         elif self.meld_type == 'run':
-            # Scala: stesso seme, consecutiva
+            # Scala: stesso seme, consecutiva (supporta Asso alto: Q-K-A)
             ranks = sorted([c.rank for c in self.cards if c.rank != CardRank.JOKER])
             if not ranks:
                 return False
             suit = self.cards[0].suit if self.cards[0].rank != CardRank.JOKER else self.cards[1].suit
             if card.suit != suit:
                 return False
-            # Può estendere in alto o in basso
-            return card.rank == ranks[0] - 1 or card.rank == ranks[-1] + 1
+            # Può estendere in basso
+            if card.rank == ranks[0] - 1:
+                return True
+            # Può estendere in alto
+            if card.rank == ranks[-1] + 1:
+                return True
+            # Asso alto: se la scala finisce con K (13), l'Asso (1) può chiudere
+            if card.rank == CardRank.ACE and ranks[-1] == CardRank.KING:
+                return True
+            return False
         return False
     
     def has_joker(self) -> bool:
@@ -162,11 +179,13 @@ class PinnacolaEnv(gym.Env):
     REWARD_WIN = 100
     REWARD_LOSE = -100
     
-    def __init__(self, num_players: int = 4):
+    def __init__(self, num_players: int = 4, auto_simulate_opponents: bool = True):
         super().__init__()
         
         self.num_players = num_players
         self.bot_player_id = 0  # Il bot è sempre il giocatore 0
+        self.auto_simulate_opponents = auto_simulate_opponents
+        self.opponent_policy_fn = None
         
         # Inizializza i due mazzi di carte (108 carte totali)
         self.all_cards = self._create_decks()
@@ -231,9 +250,9 @@ class PinnacolaEnv(gym.Env):
                         suit=CardSuit(suit),
                         deck_id=deck_id
                     ))
-            # 2 Jolly per mazzo
-            cards.append(Card(rank=CardRank.JOKER, suit=CardSuit.NONE, deck_id=deck_id))
-            cards.append(Card(rank=CardRank.JOKER, suit=CardSuit.NONE, deck_id=deck_id))
+            # 2 Jolly per mazzo — deck_id unici per evitare collisioni hash
+            cards.append(Card(rank=CardRank.JOKER, suit=CardSuit.NONE, deck_id=deck_id * 2))
+            cards.append(Card(rank=CardRank.JOKER, suit=CardSuit.NONE, deck_id=deck_id * 2 + 1))
         return cards
     
     def _get_action_space_size(self) -> int:
@@ -269,12 +288,15 @@ class PinnacolaEnv(gym.Env):
             encoded[base_idx + self.TOTAL_CARDS + 2] = len(meld.cards)
         return encoded
     
-    def _get_observation(self) -> np.ndarray:
-        """Compone l'observation vector completo."""
+    def _get_observation(self, player_id: Optional[int] = None) -> np.ndarray:
+        """Compone l'observation vector completo per un dato giocatore."""
+        if player_id is None:
+            player_id = self.current_player
+            
         obs_parts = []
         
-        # 1. Mano del bot (one-hot)
-        bot_hand = self.player_hands[self.bot_player_id]
+        # 1. Mano del giocatore (one-hot)
+        bot_hand = self.player_hands[player_id]
         obs_parts.append(self._encode_hand(bot_hand))
         
         # 2. Carta in cima al pozzo
@@ -295,12 +317,15 @@ class PinnacolaEnv(gym.Env):
         
         # 5. Numero carte in mano agli avversari
         opponent_cards = np.zeros(self.num_players - 1, dtype=np.float32)
-        for i in range(1, self.num_players):
-            opponent_cards[i-1] = len(self.player_hands[i]) / self.MAX_HAND_SIZE
+        idx = 0
+        for i in range(self.num_players):
+            if i != player_id:
+                opponent_cards[idx] = len(self.player_hands[i]) / self.MAX_HAND_SIZE
+                idx += 1
         obs_parts.append(opponent_cards)
         
         # 6. Carte viste (memoria per probabilità)
-        obs_parts.append(self.cards_seen.astype(np.float32) / self.NUM_DECKS)
+        obs_parts.append(self.cards_seen[player_id].astype(np.float32) / self.NUM_DECKS)
         
         # 7. Fase del turno (one-hot)
         phase = np.zeros(4, dtype=np.float32)
@@ -309,30 +334,34 @@ class PinnacolaEnv(gym.Env):
         
         return np.concatenate(obs_parts)
     
-    def _get_legal_actions(self) -> List[Tuple[int, int, int, int]]:
+    def _get_legal_actions(self, player_id: Optional[int] = None) -> List[Tuple[int, int, int, int]]:
         """
         Restituisce lista di azioni legali come tuple.
         Usato per generare la action mask.
         """
+        if player_id is None:
+            player_id = self.current_player
+            
         legal = []
-        bot_hand = self.player_hands[self.bot_player_id]
+        bot_hand = self.player_hands[player_id]
         
         if self.game_phase == GamePhase.DRAW:
-            # Può pescare dal tallone se disponibile
+            # Le azioni DRAW non dipendono dalle carte in mano
+            # (il bot deve poter pescare anche con mano vuota)
             if self.stock_pile:
-                for card in bot_hand:
-                    legal.append((ActionType.DRAW_STOCK, self.card_to_idx[card], 0, 0))
-            # Può raccogliere dal pozzo
+                legal.append((ActionType.DRAW_STOCK, 0, 0, 0))
             if self.discard_pile:
-                for card in bot_hand:
-                    legal.append((ActionType.DRAW_PILE, self.card_to_idx[card], 0, 0))
+                legal.append((ActionType.DRAW_PILE, 0, 0, 0))
                     
         elif self.game_phase == GamePhase.MELD:
-            # Può calare combinazioni
+            # Può calare combinazioni — un'azione per meld, distinguendo SET/RUN
             melds_possible = self._find_valid_melds(bot_hand)
-            for meld_cards in melds_possible:
-                for card in meld_cards:
-                    legal.append((ActionType.MELD_SET, self.card_to_idx[card], 0, len(meld_cards)))
+            for meld_idx_local, meld_cards in enumerate(melds_possible):
+                is_set = len(set(c.rank for c in meld_cards if c.rank != CardRank.JOKER)) == 1
+                action_type = ActionType.MELD_SET if is_set else ActionType.MELD_RUN
+                # Usa la prima carta non-Jolly come identificativo
+                repr_card = next((c for c in meld_cards if c.rank != CardRank.JOKER), meld_cards[0])
+                legal.append((action_type, self.card_to_idx[repr_card], 0, len(meld_cards)))
             
             # Può attaccare carte ai giochi esistenti
             for meld_idx, meld in enumerate(self.table_melds):
@@ -340,12 +369,10 @@ class PinnacolaEnv(gym.Env):
                     if meld.can_attach(card):
                         legal.append((ActionType.ATTACH_CARD, self.card_to_idx[card], meld_idx, 0))
             
-            # Può sostituire Jolly
+            # Può sostituire Jolly su QUALSIASI meld (non solo propri)
             for meld_idx, meld in enumerate(self.table_melds):
-                if meld.has_joker() and meld.owner == self.bot_player_id:
-                    joker = meld.get_replaceable_joker()
+                if meld.has_joker():
                     for card in bot_hand:
-                        # Logica di sostituzione
                         if self._can_replace_joker(meld, card):
                             legal.append((ActionType.REPLACE_JOKER, self.card_to_idx[card], meld_idx, 0))
             
@@ -356,8 +383,9 @@ class PinnacolaEnv(gym.Env):
             # Deve scartare una carta dalla mano
             for card in bot_hand:
                 legal.append((ActionType.DISCARD, self.card_to_idx[card], 0, 0))
-            # Può chiudere se ha calato e mano vuota
-            if self.bot_melded_this_turn and len(bot_hand) == 0:
+            # Può chiudere se mano vuota e ha calato almeno un gioco in totale
+            has_melded_ever = any(m.owner == player_id for m in self.table_melds)
+            if len(bot_hand) == 0 and has_melded_ever:
                 legal.append((ActionType.CLOSE_ROUND, 0, 0, 0))
         
         return legal
@@ -365,6 +393,8 @@ class PinnacolaEnv(gym.Env):
     def _find_valid_melds(self, hand: List[Card]) -> List[List[Card]]:
         """Trova tutte le combinazioni valide (tris/scale) nella mano."""
         valid_melds = []
+        
+        import itertools
         
         # Raggruppa carte per rank (per tris/quartetti)
         rank_groups: Dict[int, List[Card]] = {}
@@ -382,40 +412,101 @@ class PinnacolaEnv(gym.Env):
         
         # Trova tris (3+ dello stesso rank, semi diversi)
         for rank, cards in rank_groups.items():
-            if len(cards) >= 3:
-                # Tris senza Jolly
-                valid_melds.append(cards[:3])
-                if len(cards) >= 4:
-                    valid_melds.append(cards[:4])
-            elif len(cards) == 2 and num_jokers >= 1:
-                # Tris con Jolly
-                valid_melds.append(cards + [jokers[0]])
+            # Raggruppa per seme per evitare duplicati dello stesso seme nel tris
+            suits_dict = {}
+            for c in cards:
+                if c.suit not in suits_dict:
+                    suits_dict[c.suit] = []
+                suits_dict[c.suit].append(c)
+            
+            available_suits = list(suits_dict.keys())
+            
+            # Tris senza Jolly: almeno 3 semi diversi (3 o 4 carte)
+            for k in range(3, min(len(available_suits) + 1, 5)):
+                for subset_suits in itertools.combinations(available_suits, k):
+                    for combo in itertools.product(*(suits_dict[s] for s in subset_suits)):
+                        valid_melds.append(list(combo))
+            
+            # Tris con Jolly: 2 semi DIVERSI + 1 Jolly = tris (size 3)
+            # NB: non serve quartetto con jolly (4 semi coprono già tutto)
+            if num_jokers >= 1 and len(available_suits) >= 2:
+                for subset_suits in itertools.combinations(available_suits, 2):
+                    for combo in itertools.product(*(suits_dict[s] for s in subset_suits)):
+                        valid_melds.append(list(combo) + [jokers[0]])
         
-        # Trova scale (4+ carte consecutive, stesso seme)
+        # Trova scale (3+ carte consecutive, stesso seme)
         for suit in range(4):  # Per ogni seme
-            suit_cards = [c for c in hand if c.suit == CardSuit(suit) and c.rank != CardRank.JOKER]
-            suit_cards.sort(key=lambda c: c.rank)
+            rank_map = {}
+            for c in hand:
+                if c.suit == CardSuit(suit) and c.rank != CardRank.JOKER:
+                    if c.rank not in rank_map:
+                        rank_map[c.rank] = []
+                    rank_map[c.rank].append(c)
             
-            # Trova sequenze consecutive
-            if len(suit_cards) >= 4:
-                # Cerca tutte le scale possibili (minimo 4 carte)
-                for i in range(len(suit_cards)):
-                    for j in range(i + 4, min(i + 14, len(suit_cards) + 1)):
-                        subset = suit_cards[i:j]
-                        # Verifica se sono consecutive
-                        ranks = [c.rank for c in subset]
-                        if len(ranks) >= 4 and max(ranks) - min(ranks) == len(ranks) - 1:
-                            valid_melds.append(subset[:])
+            if not rank_map:
+                continue
+                
+            ranks_present = sorted(list(rank_map.keys()))
             
-            # Scale con Jolly (es: 3-4-5 + Jolly = 3-4-5-6 oppure 2-3-4 + Jolly = A-2-3-4 o 2-3-4-5)
-            if len(suit_cards) >= 3 and num_jokers >= 1:
-                for i in range(len(suit_cards) - 2):
-                    subset = suit_cards[i:i+3]
-                    ranks = [c.rank for c in subset]
-                    # Verifica gap di 1 (es: 3-4-6, Jolly può essere 5)
-                    if ranks[1] == ranks[0] + 1 and ranks[2] == ranks[1] + 1:
-                        # Scale consecutive con Jolly aggiunto
-                        valid_melds.append(subset + [jokers[0]])
+            # Trova sequenze senza Jolly
+            for i in range(len(ranks_present)):
+                for j in range(i + 3, len(ranks_present) + 1):
+                    subset_ranks = ranks_present[i:j]
+                    # Verifica se sono perfettamente consecutivi
+                    if subset_ranks[-1] - subset_ranks[0] == len(subset_ranks) - 1:
+                        for combo in itertools.product(*(rank_map[r] for r in subset_ranks)):
+                            valid_melds.append(list(combo))
+            
+            # Scala Asso-alto senza Jolly: ..., Q, K, A
+            if CardRank.ACE in rank_map:
+                # Cerca sequenze che finiscono con K (13) e aggiungi A
+                for i in range(len(ranks_present)):
+                    for j in range(i + 2, len(ranks_present) + 1):
+                        subset_ranks = ranks_present[i:j]
+                        if CardRank.ACE in subset_ranks:
+                            continue  # A è già nella sequenza come basso
+                        if subset_ranks[-1] == CardRank.KING and subset_ranks[-1] - subset_ranks[0] == len(subset_ranks) - 1:
+                            # Sequenza valida che finisce con K, aggiungi A
+                            for combo_base in itertools.product(*(rank_map[r] for r in subset_ranks)):
+                                for ace_card in rank_map[CardRank.ACE]:
+                                    valid_melds.append(list(combo_base) + [ace_card])
+            
+            # Trova sequenze con 1 Jolly
+            if num_jokers >= 1:
+                for i in range(len(ranks_present)):
+                    for j in range(i + 2, len(ranks_present) + 1):
+                        subset_ranks = ranks_present[i:j]
+                        gap = subset_ranks[-1] - subset_ranks[0]
+                        # "Buco" di una carta tra gli estremi -> Scala valida con inserimento del Jolly
+                        if gap == len(subset_ranks):
+                            for combo in itertools.product(*(rank_map[r] for r in subset_ranks)):
+                                valid_melds.append(list(combo) + [jokers[0]])
+                        # Estremi consecutivi (es 3-4 e Jolly forma J-3-4 o 3-4-J)
+                        elif gap == len(subset_ranks) - 1:
+                            for combo in itertools.product(*(rank_map[r] for r in subset_ranks)):
+                                valid_melds.append(list(combo) + [jokers[0]])
+            
+            # Trova sequenze con 2 Jolly
+            if num_jokers >= 2:
+                for i in range(len(ranks_present)):
+                    for j in range(i + 1, len(ranks_present) + 1):
+                        subset_ranks = ranks_present[i:j]
+                        num_real = len(subset_ranks)
+                        span = subset_ranks[-1] - subset_ranks[0] + 1
+                        gaps = span - num_real
+                        total_len = span  # lunghezza della scala risultante
+                        # Serve esattamente 2 jolly per i buchi, e scala almeno 3
+                        if gaps == 2 and total_len >= 3:
+                            for combo in itertools.product(*(rank_map[r] for r in subset_ranks)):
+                                valid_melds.append(list(combo) + jokers[:2])
+                        # 1 buco interno + 1 jolly per estendere (sopra o sotto)
+                        elif gaps == 1 and total_len + 1 >= 3:
+                            for combo in itertools.product(*(rank_map[r] for r in subset_ranks)):
+                                valid_melds.append(list(combo) + jokers[:2])
+                        # 0 buchi interni + 2 jolly per estendere
+                        elif gaps == 0 and num_real >= 1 and num_real + 2 >= 3:
+                            for combo in itertools.product(*(rank_map[r] for r in subset_ranks)):
+                                valid_melds.append(list(combo) + jokers[:2])
         
         return valid_melds
     
@@ -436,10 +527,16 @@ class PinnacolaEnv(gym.Env):
         
         if meld.meld_type == 'set':
             # In un tris, il Jolly rappresenta il rank del tris
-            return card.rank == meld.cards[0].rank and card.rank != CardRank.JOKER
+            non_joker = [c for c in meld.cards if c.rank != CardRank.JOKER]
+            if not non_joker:
+                return False
+            if card.rank != non_joker[0].rank or card.rank == CardRank.JOKER:
+                return False
+            # Verifica che il seme non sia già presente
+            existing_suits = {c.suit for c in non_joker}
+            return card.suit not in existing_suits
         elif meld.meld_type == 'run':
             # In una scala, il Jolly rappresenta un rank specifico nella sequenza
-            # Trova che rank rappresenta il Jolly
             ranks = sorted([c.rank for c in meld.cards if c.rank != CardRank.JOKER])
             suits = [c.suit for c in meld.cards if c.suit != CardSuit.NONE]
             if not ranks or not suits:
@@ -449,23 +546,26 @@ class PinnacolaEnv(gym.Env):
             if card.suit != suit:
                 return False
             
-            # Il Jolly può essere in qualsiasi posizione della scala
-            # Verifica se la carta potrebbe completare la sequenza
+            # Il Jolly può essere in qualsiasi posizione gap della scala
             possible_gaps = []
             for i in range(len(ranks) - 1):
                 if ranks[i+1] - ranks[i] > 1:
                     possible_gaps.extend(range(ranks[i] + 1, ranks[i+1]))
             
-            # O estendi oltre gli estremi
-            possible_ranks = possible_gaps + [ranks[0] - 1, ranks[-1] + 1]
+            # Verifica anche Asso alto (rank 1 sostituisce dopo K=13)
+            possible_ranks = possible_gaps
+            if ranks[-1] + 1 == CardRank.JOKER:
+                # ranks[-1] è 13 (K), il jolly potrebbe rappresentare l'Asso alto
+                if card.rank == CardRank.ACE:
+                    return True
             return card.rank in possible_ranks
         
         return False
     
-    def _get_action_mask(self) -> np.ndarray:
+    def _get_action_mask(self, player_id: Optional[int] = None) -> np.ndarray:
         """Genera maschera booleana per azioni legali."""
         mask = np.zeros(self._get_action_space_size(), dtype=np.int8)
-        legal_actions = self._get_legal_actions()
+        legal_actions = self._get_legal_actions(player_id)
         
         for action in legal_actions:
             # Flatten action tuple to index
@@ -501,13 +601,14 @@ class PinnacolaEnv(gym.Env):
         
         # Reset stato
         self.table_melds = []
-        self.cards_seen = np.zeros(self.TOTAL_CARDS, dtype=np.int32)
+        self.cards_seen = np.zeros((self.num_players, self.TOTAL_CARDS), dtype=np.int32)
         
-        # Registra carte già viste (carte in mano bot + pozzo)
-        for card in self.player_hands[self.bot_player_id]:
-            self.cards_seen[self.card_to_idx[card]] += 1
-        for card in self.discard_pile:
-            self.cards_seen[self.card_to_idx[card]] += 1
+        # Registra carte già viste per ogni giocatore
+        for p in range(self.num_players):
+            for card in self.player_hands[p]:
+                self.cards_seen[p, self.card_to_idx[card]] += 1
+            for card in self.discard_pile:
+                self.cards_seen[p, self.card_to_idx[card]] += 1
         
         self.current_player = 0
         self.game_phase = GamePhase.DRAW
@@ -567,8 +668,12 @@ class PinnacolaEnv(gym.Env):
             reward += self._action_close_round()
         
         # Simula turni avversari se necessario
-        if self.current_player != self.bot_player_id and not self.round_over:
+        if self.auto_simulate_opponents and self.current_player != self.bot_player_id and not self.round_over:
             self._simulate_opponent_turns()
+        
+        # Stalemate: se tallone e pozzo vuoti, la partita finisce
+        if not self.stock_pile and not self.discard_pile and not self.round_over:
+            self.round_over = True
         
         # Verifica fine round
         if self.round_over:
@@ -587,8 +692,8 @@ class PinnacolaEnv(gym.Env):
             return -1.0  # Penalità azione illegale
         
         card = self.stock_pile.pop()
-        self.player_hands[self.bot_player_id].append(card)
-        self.cards_seen[self.card_to_idx[card]] += 1
+        self.player_hands[self.current_player].append(card)
+        self.cards_seen[self.current_player, self.card_to_idx[card]] += 1
         self.bot_has_drawn = True
         self.game_phase = GamePhase.MELD
         return 0.1  # Piccola reward per azione valida
@@ -601,10 +706,7 @@ class PinnacolaEnv(gym.Env):
         # Raccoglie tutte le carte dal pozzo
         cards_to_take = self.discard_pile[:]
         self.discard_pile = []
-        self.player_hands[self.bot_player_id].extend(cards_to_take)
-        
-        for card in cards_to_take:
-            self.cards_seen[self.card_to_idx[card]] += 1
+        self.player_hands[self.current_player].extend(cards_to_take)
         
         self.bot_has_drawn = True
         self.game_phase = GamePhase.MELD
@@ -616,15 +718,24 @@ class PinnacolaEnv(gym.Env):
             return -1.0
         
         # Trova la combinazione valida che corrisponde
-        bot_hand = self.player_hands[self.bot_player_id]
+        bot_hand = self.player_hands[self.current_player]
         valid_melds = self._find_valid_melds(bot_hand)
         
         if not valid_melds:
             return -1.0  # Nessuna combinazione valida
         
-        # Prendi la prima combinazione valida (semplificazione)
-        # In un sistema completo, il parametro indicherebbe quale combinazione
-        meld_cards = valid_melds[0]
+        target_card = self.idx_to_card.get(card_idx)
+        
+        # Cerca la combinazione che corrisponde a target_card e num_cards
+        meld_cards = None
+        for m in valid_melds:
+            if len(m) == num_cards and target_card in m:
+                meld_cards = m
+                break
+                
+        if not meld_cards:
+            # Fallback (non dovrebbe verificarsi in un mapping corretto azione-stato)
+            meld_cards = valid_melds[0]
         
         # Rimuovi carte dalla mano
         for card in meld_cards:
@@ -640,7 +751,7 @@ class PinnacolaEnv(gym.Env):
             meld_id=len(self.table_melds),
             meld_type=meld_type_str,
             cards=meld_cards[:],
-            owner=self.bot_player_id
+            owner=self.current_player
         )
         self.table_melds.append(new_meld)
         self.bot_melded_this_turn = True
@@ -660,7 +771,7 @@ class PinnacolaEnv(gym.Env):
             return -1.0
         
         card = self.idx_to_card.get(card_idx)
-        if not card or card not in self.player_hands[self.bot_player_id]:
+        if not card or card not in self.player_hands[self.current_player]:
             return -1.0
         
         meld = self.table_melds[meld_idx]
@@ -669,7 +780,7 @@ class PinnacolaEnv(gym.Env):
             return -1.0
         
         # Rimuovi carta dalla mano e aggiungi al meld
-        self.player_hands[self.bot_player_id].remove(card)
+        self.player_hands[self.current_player].remove(card)
         meld.cards.append(card)
         
         return self.POINTS_ATTACH
@@ -683,13 +794,10 @@ class PinnacolaEnv(gym.Env):
             return -1.0
         
         card = self.idx_to_card.get(card_idx)
-        if not card or card not in self.player_hands[self.bot_player_id]:
+        if not card or card not in self.player_hands[self.current_player]:
             return -1.0
         
         meld = self.table_melds[meld_idx]
-        
-        if meld.owner != self.bot_player_id:
-            return -1.0
         
         if not self._can_replace_joker(meld, card):
             return -1.0
@@ -703,10 +811,10 @@ class PinnacolaEnv(gym.Env):
         meld.cards.append(card)
         
         # Aggiungi Jolly alla mano
-        self.player_hands[self.bot_player_id].append(joker)
+        self.player_hands[self.current_player].append(joker)
         
         # Rimuovi carta usata per sostituzione
-        self.player_hands[self.bot_player_id].remove(card)
+        self.player_hands[self.current_player].remove(card)
         
         return self.POINTS_REPLACE_JOKER
     
@@ -720,12 +828,15 @@ class PinnacolaEnv(gym.Env):
     def _action_discard(self, card_idx: int) -> float:
         """Scarta una carta."""
         card = self.idx_to_card.get(card_idx)
-        if not card or card not in self.player_hands[self.bot_player_id]:
+        if not card or card not in self.player_hands[self.current_player]:
             return -1.0
         
-        self.player_hands[self.bot_player_id].remove(card)
+        self.player_hands[self.current_player].remove(card)
         self.discard_pile.append(card)
-        self.cards_seen[self.card_to_idx[card]] += 1
+        
+        for p in range(self.num_players):
+            if p != self.current_player:
+                self.cards_seen[p, self.card_to_idx[card]] += 1
         
         # Passa al prossimo giocatore
         self.current_player = (self.current_player + 1) % self.num_players
@@ -738,14 +849,19 @@ class PinnacolaEnv(gym.Env):
     
     def _action_close_round(self) -> float:
         """Chiude il round."""
-        if not self.bot_melded_this_turn or self.player_hands[self.bot_player_id]:
+        has_melded = any(m.owner == self.current_player for m in self.table_melds)
+        if not has_melded or self.player_hands[self.current_player]:
             return -1.0
         
         self.round_over = True
         return self.REWARD_WIN
     
     def _simulate_opponent_turns(self):
-        """Simula turni avversari con politica semplice (greedy)."""
+        """
+        Simula turni avversari con politica semi-random realistica.
+        Ogni avversario: pesca 1, cala al massimo 1 combinazione,
+        attacca con probabilità 50%, scarta 1.
+        """
         while self.current_player != self.bot_player_id and not self.round_over:
             player = self.current_player
             hand = self.player_hands[player]
@@ -759,47 +875,63 @@ class PinnacolaEnv(gym.Env):
                 card = self.discard_pile.pop()
                 hand.append(card)
             else:
-                # Nessuna carta disponibile
+                # Nessuna carta disponibile — stalemate
+                self.round_over = True
                 break
             
-            # Fase 2: Prova a calare (greedy)
+            # Fase 2: Prova a calare AL MASSIMO 1 combinazione (realistico)
             valid_melds = self._find_valid_melds(hand)
-            for meld_cards in valid_melds:
-                # Rimuovi carte
-                for c in meld_cards:
-                    if c in hand:
+            if valid_melds:
+                # Sceglie una combinazione a caso
+                meld_cards = valid_melds[self.np_random.integers(len(valid_melds))]
+                
+                # Verifica che tutte le carte siano ancora in mano
+                can_play = all(c in hand for c in meld_cards)
+                if can_play:
+                    for c in meld_cards:
                         hand.remove(c)
-                
-                # Crea meld
-                is_set = len(set(c.rank for c in meld_cards if c.rank != CardRank.JOKER)) == 1
-                new_meld = Meld(
-                    meld_id=len(self.table_melds),
-                    meld_type='set' if is_set else 'run',
-                    cards=meld_cards[:],
-                    owner=player
-                )
-                self.table_melds.append(new_meld)
-                
-                # Prova ad attaccare altre carte
+                    
+                    is_set = len(set(c.rank for c in meld_cards if c.rank != CardRank.JOKER)) == 1
+                    new_meld = Meld(
+                        meld_id=len(self.table_melds),
+                        meld_type='set' if is_set else 'run',
+                        cards=meld_cards[:],
+                        owner=player
+                    )
+                    self.table_melds.append(new_meld)
+            
+            # Fase 2b: Prova ad attaccare UNA carta (50% probabilità)
+            if hand and self.np_random.random() > 0.5:
                 for meld in self.table_melds:
+                    attached = False
                     for card in hand[:]:
                         if meld.can_attach(card):
                             hand.remove(card)
                             meld.cards.append(card)
+                            attached = True
+                            break  # Al massimo 1 attach per turno
+                    if attached:
+                        break
             
             # Fase 3: Scarta (carta casuale)
             if hand:
                 discard_card = hand[self.np_random.integers(len(hand))]
                 hand.remove(discard_card)
                 self.discard_pile.append(discard_card)
+                # Aggiorna cards_seen per tutti gli altri giocatori (vedono lo scarto)
+                for p in range(self.num_players):
+                    if p != player:
+                        self.cards_seen[p, self.card_to_idx[discard_card]] += 1
+            
+            # Incrementa il contatore turni per ogni giocatore
+            self.turn_count += 1
             
             # Passa al prossimo
             self.current_player = (self.current_player + 1) % self.num_players
             
-            # Verifica se ha chiuso
+            # Verifica se ha chiuso (mano vuota + almeno un gioco calato)
             if not hand and any(m.owner == player for m in self.table_melds):
                 self.round_over = True
-                # Penalità per il bot
                 break
     
     def _calculate_final_reward(self) -> float:
