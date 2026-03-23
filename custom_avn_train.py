@@ -102,33 +102,34 @@ def save_env_state(env: PinnacolaEnv) -> dict:
     """Salva lo stato mutabile dell'environment in un dizionario leggero."""
     return {
         'player_hands': [hand[:] for hand in env.player_hands],
-        'stock_pile': env.stock_pile[:],
+        'table_melds': copy.deepcopy(env.table_melds),
         'discard_pile': env.discard_pile[:],
-        'table_melds': [Meld(m.meld_id, m.meld_type, m.cards[:], m.owner) for m in env.table_melds],  # Copia manuale più veloce
-        'cards_seen': env.cards_seen.copy(),
-        'current_player': env.current_player,
+        'stock_pile': env.stock_pile[:],
         'game_phase': env.game_phase,
-        'round_over': env.round_over,
+        'current_player': env.current_player,
         'turn_count': env.turn_count,
         'bot_has_drawn': env.bot_has_drawn,
         'bot_melded_this_turn': env.bot_melded_this_turn,
-        'can_close_this_turn': env.can_close_this_turn,
+        'round_over': env.round_over,
+        'cards_seen': env.cards_seen.copy(),
+        'must_meld_card': copy.deepcopy(env.must_meld_card) if hasattr(env, 'must_meld_card') else None
     }
 
 def restore_env_state(env: PinnacolaEnv, state: dict):
     """Ripristina lo stato dell'environment da un dizionario."""
     env.player_hands = [hand[:] for hand in state['player_hands']]
-    env.stock_pile = state['stock_pile'][:]
+    env.table_melds = copy.deepcopy(state['table_melds'])
     env.discard_pile = state['discard_pile'][:]
-    env.table_melds = [Meld(m.meld_id, m.meld_type, m.cards[:], m.owner) for m in state['table_melds']]
-    env.cards_seen = state['cards_seen'].copy()
-    env.current_player = state['current_player']
+    env.stock_pile = state['stock_pile'][:]
     env.game_phase = state['game_phase']
-    env.round_over = state['round_over']
+    env.current_player = state['current_player']
     env.turn_count = state['turn_count']
     env.bot_has_drawn = state['bot_has_drawn']
     env.bot_melded_this_turn = state['bot_melded_this_turn']
-    env.can_close_this_turn = state['can_close_this_turn']
+    env.round_over = state['round_over']
+    env.cards_seen = state['cards_seen'].copy()
+    if 'must_meld_card' in state:
+        env.must_meld_card = copy.deepcopy(state['must_meld_card'])
 
 # ============================================================================
 # DEDUPLICA AZIONI (evita simulare azioni equivalenti)
@@ -143,7 +144,7 @@ def deduplicate_actions(legal_actions):
     unique = []
     for at, card, meld, param in legal_actions:
         # DRAW_STOCK e DRAW_PILE non dipendono dalla carta
-        if at in (0, 1):
+        if at == 0:  # Only DRAW_STOCK is truly deduplicatable
             key = (at,)
         # SKIP_MELD e CLOSE_ROUND non hanno parametri
         elif at in (6, 8):
@@ -333,18 +334,29 @@ def train_avn(total_timesteps=100_000, save_dir="./models"):
     for step in range(total_timesteps):
         t0 = time.time()
         
+        if step < 10:
+            print(f"[DEBUG] Step {step} Start. Env phase: {env.game_phase}, CPU: {env.current_player}")
+            
         # Epsilon decay lineare
         epsilon = eps_end + (eps_start - eps_end) * max(0, (eps_decay - step) / eps_decay)
         
         # 1. Seleziona azione (con save/restore, non deepcopy)
+        if step < 10:
+            print(f"[DEBUG] Step {step} Selecting action...")
         action_tuple = select_action(env, policy_net, epsilon, device)
         action_array = np.array(action_tuple)
         
+        if step < 10:
+            print(f"[DEBUG] Step {step} Action selected: {action_tuple}. Applying env.step...")
+            
         # 2. Applica nel vero ambiente
         next_obs, reward, terminated, truncated, _ = env.step(action_array)
         next_state = next_obs['observation']
         episode_step += 1
         
+        if step < 10:
+            print(f"[DEBUG] Step {step} env.step finished! Term: {terminated}")
+            
         if episode_step >= max_episode_steps:
             truncated = True
         done = terminated or truncated

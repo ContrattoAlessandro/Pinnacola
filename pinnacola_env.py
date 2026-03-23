@@ -953,36 +953,95 @@ class PinnacolaEnv(gym.Env):
         Ogni avversario: pesca 1, cala al massimo 1 combinazione,
         attacca con probabilità 50%, scarta 1.
         """
+        max_outer_iterations = 200  # Bug 5: safety limit on total iterations
+        outer_count = 0
+        
         while self.current_player != self.bot_player_id and not self.round_over:
+            outer_count += 1
+            if outer_count > max_outer_iterations:
+                self.round_over = True
+                break
+                
             player = self.current_player
             
             if self.opponent_policy_fn:
-                action_tuple = self.opponent_policy_fn(self, player)
-                action_type = int(action_tuple[0])
-                card_idx = int(action_tuple[1])
-                meld_idx = int(action_tuple[2])
-                param = int(action_tuple[3])
-
-                if action_type == ActionType.DRAW_STOCK:
-                    self._action_draw_stock()
-                elif action_type == ActionType.DRAW_PILE:
-                    self._action_draw_pile(card_idx)
-                elif action_type == ActionType.MELD_SET or action_type == ActionType.MELD_RUN:
-                    self._action_meld(action_type, card_idx, param)
-                elif action_type == ActionType.ATTACH_CARD:
-                    self._action_attach(card_idx, meld_idx)
-                elif action_type == ActionType.REPLACE_JOKER:
-                    self._action_replace_joker(card_idx, meld_idx)
-                elif action_type == ActionType.SKIP_MELD:
-                    self._action_skip_meld()
-                elif action_type == ActionType.DISCARD:
-                    self._action_discard(card_idx)
-                elif action_type == ActionType.CLOSE_ROUND:
-                    self._action_close_round()
+                # Bug 1+2 Fix: Run a COMPLETE TURN for this opponent
+                # The policy selects one action at a time, so we loop through
+                # all phases (DRAW → MELD → DISCARD) before advancing player.
+                max_actions_per_turn = 50  # safety limit per turn
+                actions_taken = 0
                 
-                # Controllo stalemate
-                if not self.stock_pile and not self.discard_pile:
-                    self.round_over = True
+                while self.current_player == player and not self.round_over and actions_taken < max_actions_per_turn:
+                    actions_taken += 1
+                    
+                    # Bug 4 Fix: if must_meld_card is set but no legal actions,
+                    # force-clear it to prevent stuck state
+                    legal = self._get_legal_actions(player)
+                    if not legal:
+                        if self.game_phase == GamePhase.MELD:
+                            self.must_meld_card = None  # Clear obligation
+                            self._action_skip_meld()
+                            continue
+                        elif self.game_phase == GamePhase.DISCARD:
+                            if self.player_hands[player]:
+                                card = self.player_hands[player][0]
+                                self._action_discard(self.card_to_idx[card])
+                            else:
+                                self.round_over = True
+                            continue
+                        elif self.game_phase == GamePhase.DRAW:
+                            if self.stock_pile:
+                                self._action_draw_stock()
+                            else:
+                                self.round_over = True
+                            continue
+                    
+                    action_tuple = self.opponent_policy_fn(self, player)
+                    action_type = int(action_tuple[0])
+                    card_idx = int(action_tuple[1])
+                    meld_idx = int(action_tuple[2])
+                    param = int(action_tuple[3])
+
+                    if action_type == ActionType.DRAW_STOCK:
+                        self._action_draw_stock()
+                    elif action_type == ActionType.DRAW_PILE:
+                        self._action_draw_pile(card_idx)
+                    elif action_type == ActionType.MELD_SET or action_type == ActionType.MELD_RUN:
+                        self._action_meld(action_type, card_idx, param)
+                    elif action_type == ActionType.ATTACH_CARD:
+                        self._action_attach(card_idx, meld_idx)
+                    elif action_type == ActionType.REPLACE_JOKER:
+                        self._action_replace_joker(card_idx, meld_idx)
+                    elif action_type == ActionType.SKIP_MELD:
+                        self._action_skip_meld()
+                    elif action_type == ActionType.DISCARD:
+                        self._action_discard(card_idx)
+                    
+                    # Stalemate check
+                    if not self.stock_pile and not self.discard_pile:
+                        self.round_over = True
+                        break
+                
+                # Safety: if turn didn't complete normally, force discard and advance
+                if self.current_player == player and not self.round_over:
+                    hand = self.player_hands[player]
+                    if hand:
+                        discard_card = hand[0]
+                        hand.remove(discard_card)
+                        self.discard_pile.append(discard_card)
+                        for p in range(self.num_players):
+                            if p != player:
+                                self.cards_seen[p, self.card_to_idx[discard_card]] += 1
+                    
+                    if not self.player_hands[player]:
+                        self.round_over = True
+                    else:
+                        self.current_player = (self.current_player + 1) % self.num_players
+                        self.game_phase = GamePhase.DRAW
+                        self.bot_has_drawn = False
+                        self.bot_melded_this_turn = False
+                        self.must_meld_card = None
+                        self.turn_count += 1
                 continue
             
             hand = self.player_hands[player]
